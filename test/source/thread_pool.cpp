@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 
@@ -560,3 +562,87 @@ TEST_CASE("Initialization function is called") {
     }
     CHECK_EQ(counter.load(), 4);
 }
+
+TEST_CASE("Check tasks can use clear_tasks()") {
+    // Here:
+    // - we use a barrier to trigger tasks_clear() once all threads are busy;
+    // - to prevent race conditions (e.g. task_clear() getting called whilst we are still adding
+    //   tasks), we use a mutex to prevent the tasks from running, until all tasks have been added
+    //   to the pool.
+
+    size_t thread_count = 0;
+
+    SUBCASE("with single thread") { thread_count = 1; }
+    SUBCASE("with multiple threads") { thread_count = 4; }
+
+    std::atomic_int counter = 0;
+    dp::thread_pool pool(thread_count);
+    std::shared_mutex mutex;
+
+    {
+        /* clear thread_pool when barrier is hit */
+        auto clear_func = [&pool]() { pool.clear_tasks(); };
+        std::barrier sync_point(thread_count, clear_func);
+
+        auto func = [&counter, &sync_point, &mutex]() {
+            std::shared_lock lock(mutex);
+            counter.fetch_add(1);
+            sync_point.arrive_and_wait();
+        };
+
+        {
+            std::unique_lock lock(mutex);
+            for (int i = 0; i < 10; i++) pool.enqueue_detach(func);
+        }
+
+        pool.wait_for_tasks();
+    }
+
+    CHECK_EQ(counter.load(), thread_count);
+}
+
+TEST_CASE("Check clear_tasks() clears tasks") {
+    // Here we:
+    // - add a recursive task that adds additional tasks, to make sure the thread_pool has
+    //   enough tasks
+    // - use a lock to prevent race conditions (e.g. clear_task() running whilst the another task is
+    //   being added)
+
+    int thread_count = 4;
+    std::atomic_int counter = 0;
+
+    SUBCASE("with no thread") { thread_count = 0; }
+    SUBCASE("with single thread") { thread_count = 1; }
+    SUBCASE("with multiple threads") { thread_count = 4; }
+
+    {
+        std::shared_mutex mutex;
+        dp::thread_pool pool(thread_count);
+
+        /* create a recrusive task that adds more tasks */
+        std::function<void(void)> func;
+        func = [&counter, &mutex, &pool, &func]() {
+            counter.fetch_add(1);
+            pool.enqueue_detach(func);
+            std::shared_lock lock(mutex);
+        };
+
+        /* load all threads twice over*/
+        for (int i = 0; i < 2 * thread_count; i++) pool.enqueue_detach(func);
+
+        {
+            /* wait until all threads running and locked in a task */
+            std::unique_lock lock(mutex);
+            while (counter != thread_count)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            pool.clear_tasks();
+        }
+    }
+
+    CHECK_EQ(thread_count, counter.load());
+}
+
+
+
+

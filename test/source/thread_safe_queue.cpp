@@ -61,7 +61,7 @@ TEST_CASE("Ensure clear() works and returns correct count") {
     // - that clear() return the correct number
 
     std::barrier barrier(3);
-    std::atomic removed_count{0};
+    std::atomic<size_t> removed_count{0};
 
     dp::thread_safe_queue<int> queue;
     {
